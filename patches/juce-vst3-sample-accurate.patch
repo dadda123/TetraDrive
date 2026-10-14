@@ -1,0 +1,59 @@
+diff --git a/external/JUCE/modules/juce_audio_plugin_client/juce_audio_plugin_client_VST3.cpp b/external/JUCE/modules/juce_audio_plugin_client/juce_audio_plugin_client_VST3.cpp
+index 1d3e2ed..11486a4 100644
+--- a/external/JUCE/modules/juce_audio_plugin_client/juce_audio_plugin_client_VST3.cpp
++++ b/external/JUCE/modules/juce_audio_plugin_client/juce_audio_plugin_client_VST3.cpp
+@@ -3533,7 +3533,15 @@ public:
+                 if (const auto change = getPointFromQueue (paramQueue, numPoints - 1))
+                 {
+                     if (auto* param = comPluginInstance->getParamForVSTParamID (vstParamID))
++                    {
++                        // Local patch (TetraDrive): forward every point with its sample offset.
++                        if (auto* sink = dynamic_cast<SampleAccurateParameterSink*> (pluginInstance))
++                            for (Steinberg::int32 point = 0; point < numPoints; ++point)
++                                if (const auto p = getPointFromQueue (paramQueue, point))
++                                    sink->addParameterPoint (*param, (int) p->offsetSamples, (float) p->value);
++
+                         setValueAndNotifyIfChanged (*param, (float) change->value);
++                    }
+                 }
+             }
+         }
+diff --git a/external/JUCE/modules/juce_audio_processors_headless/juce_audio_processors_headless.h b/external/JUCE/modules/juce_audio_processors_headless/juce_audio_processors_headless.h
+index 16adc9e..a5b3372 100644
+--- a/external/JUCE/modules/juce_audio_processors_headless/juce_audio_processors_headless.h
++++ b/external/JUCE/modules/juce_audio_processors_headless/juce_audio_processors_headless.h
+@@ -140,6 +140,7 @@
+ #include <juce_audio_processors_headless/format_types/juce_ARACommon.h>
+ #include <juce_audio_processors_headless/utilities/juce_AudioPluginExtensions.h>
+ #include <juce_audio_processors_headless/processors/juce_AudioProcessorParameter.h>
++#include <juce_audio_processors_headless/utilities/juce_SampleAccurateParameterSink.h>
+ #include <juce_audio_processors_headless/processors/juce_HostedAudioProcessorParameter.h>
+ #include <juce_audio_processors_headless/processors/juce_AudioProcessorParameterGroup.h>
+ #include <juce_audio_processors_headless/processors/juce_AudioProcessor.h>
+diff --git a/external/JUCE/modules/juce_audio_processors_headless/utilities/juce_SampleAccurateParameterSink.h b/external/JUCE/modules/juce_audio_processors_headless/utilities/juce_SampleAccurateParameterSink.h
+new file mode 100644
+index 0000000..2ac41b0
+--- /dev/null
++++ b/external/JUCE/modules/juce_audio_processors_headless/utilities/juce_SampleAccurateParameterSink.h
+@@ -0,0 +1,21 @@
++/*
++  ==============================================================================
++
++   Local patch (TetraDrive): sample-accurate parameter points for VST3.
++
++  ==============================================================================
++*/
++
++namespace juce
++{
++
++// Implement on an AudioProcessor to receive every automation point with its sample offset.
++struct SampleAccurateParameterSink
++{
++    virtual ~SampleAccurateParameterSink() = default;
++
++    // Called on the audio thread before processBlock, once per queued point.
++    virtual void addParameterPoint (AudioProcessorParameter& parameter, int sampleOffset, float value) noexcept = 0;
++};
++
++} // namespace juce
