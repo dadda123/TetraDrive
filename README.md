@@ -2,7 +2,7 @@
 
 TetraDrive is a faithful emulation of a popular multiband distortion unit from the early 2000s. It splits the signal into four frequency bands and drives each one through a waveshaper, then sums them back together.
 
-**Free download (Windows, VST3):** [daddasounds.com](https://daddasounds.com)
+**Free download (Windows, VST3):** [daddasounds.com](https://daddasounds.com/products/tetradrive.html)
 
 ## Features
 
