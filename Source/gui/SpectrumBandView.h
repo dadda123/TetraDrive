@@ -8,12 +8,15 @@
 #include "HelpBar.h"
 
 class TetraDriveProcessor;
+class SpectrumAnalyzer;
 
 namespace tdui {
 
+class MeterDisplay;
+
 class SpectrumBandView : public juce::Component {
 public:
-    explicit SpectrumBandView(TetraDriveProcessor&);
+    SpectrumBandView(TetraDriveProcessor&, const MeterDisplay&);
 
     std::function<void(const HelpInfo&)> onHelp;
 
@@ -45,7 +48,10 @@ private:
     };
 
     void rebuildCurves();
-    void rebuildSpectrumPath();
+    void rebuildSpectrumPaths();
+    void buildSpectrumPath(const std::vector<float>& db, juce::Path& fill, juce::Path& line) const;
+    // Advances one analyzer or, when hidden, keeps its history current and clears its trace.
+    void updateAnalyzer(SpectrumAnalyzer& analyzer, bool show, std::vector<float>& db, double dt);
 
     Target hitTestTarget(juce::Point<float>) const;
     HelpInfo helpFor(const Target&) const;
@@ -67,16 +73,18 @@ private:
     void endDrag();
 
     TetraDriveProcessor& proc_;
+    const MeterDisplay& meters_;
     juce::VBlankAttachment vblank_;
     juce::Rectangle<float> plot_;
+    std::array<int, 4> shownSaturation_{};   // quantised puck glow last painted
 
-    std::vector<float> freqs_, specDb_;
-    juce::Path specFill_, specLine_;
+    std::vector<float> freqs_, inDb_, outDb_;
+    juce::Path inFill_, inLine_, outFill_, outLine_;
     std::array<juce::Path, 4> bandCurves_;
     juce::Path sumCurve_;
     std::vector<float> curveKey_;
     double lastTs_ = 0.0;
-    bool analyzerWasOn_ = false;
+    bool showIn_ = false, showOut_ = false;
 
     Target hover_, drag_;
     juce::Point<float> mousePos_;

@@ -4,10 +4,12 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <complex>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
+#include "td_oversample.h"
 #include "td_tables.h"
 
 namespace td {
@@ -103,6 +105,121 @@ inline void runSection(const Section& s, SectionState& st, const float* in, floa
     st.y1 = y1; st.y2 = y2; st.y3 = y3; st.y4 = y4;
 }
 
+// ---- Linkwitz-Riley ("Flat") crossover ------------------------------------------------------
+// Each split is LR4: a 2nd-order Butterworth biquad applied twice. LP^2 + HP^2 of the same
+// biquad is exactly a 2nd-order all-pass with the same poles, so a band can be written as a
+// product of factors from the input and the four bands still sum to a pure all-pass:
+//   band 1 = LP(x1) AP(x2) AP(x3)
+//   band 2 = HP(x1) LP(x2) AP(x3)
+//   band 3 = HP(x1) HP(x2) LP(x3)
+//   band 4 = HP(x1) HP(x2) HP(x3)
+// with HP/LP meaning LR4 (two biquads) and AP one biquad. The low and high cuts are applied
+// once, ahead of the split, so they shape the sum without disturbing the flatness.
+
+struct Biquad {
+    double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+};
+
+struct BiquadState {
+    double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    void reset() { *this = BiquadState{}; }
+};
+
+enum class BiquadKind { LowPass, HighPass, AllPass };
+
+// RBJ Butterworth (Q = 1/sqrt 2) biquad; the bilinear transform is exact at hz.
+inline Biquad designButterworthBiquad(BiquadKind kind, double sampleRate, double hz) {
+    constexpr double kPi = 3.14159265358979323846;
+    hz = std::clamp(hz, 1.0, sampleRate * 0.495);
+    const double w = 2.0 * kPi * hz / sampleRate;
+    const double c = std::cos(w), alpha = std::sin(w) * 0.70710678118654752;
+    const double a0 = 1.0 + alpha;
+    Biquad q;
+    switch (kind) {
+        case BiquadKind::LowPass:  q.b0 = (1.0 - c) * 0.5; q.b1 = 1.0 - c; q.b2 = q.b0; break;
+        case BiquadKind::HighPass: q.b0 = (1.0 + c) * 0.5; q.b1 = -(1.0 + c); q.b2 = q.b0; break;
+        case BiquadKind::AllPass:  q.b0 = 1.0 - alpha; q.b1 = -2.0 * c; q.b2 = 1.0 + alpha; break;
+    }
+    q.b0 /= a0; q.b1 /= a0; q.b2 /= a0;
+    q.a1 = -2.0 * c / a0;
+    q.a2 = (1.0 - alpha) / a0;
+    return q;
+}
+
+inline void runBiquad(const Biquad& q, BiquadState& st, const float* in, float* out, int n) {
+    double x1 = st.x1, x2 = st.x2, y1 = st.y1, y2 = st.y2;
+    for (int i = 0; i < n; ++i) {
+        const double x = static_cast<double>(in[i]);
+        const double y = q.b0 * x + q.b1 * x1 + q.b2 * x2 - q.a1 * y1 - q.a2 * y2;
+        out[i] = static_cast<float>(y);
+        x2 = x1; x1 = x;
+        y2 = y1; y1 = y;
+    }
+    if (y1 < 1e-15 && -1e-15 < y1) y1 = y2 = 0.0;
+    st.x1 = x1; st.x2 = x2; st.y1 = y1; st.y2 = y2;
+}
+
+enum class Crossover : int { Classic = 0, Flat = 1 };
+
+inline constexpr int kMaxBiquadsPerBand = 10;   // three LR4 splits plus both cuts (display only)
+
+// One band's filter in either mode, plus its frequency response for display.
+struct BandFilter {
+    std::array<Section, kSectionsPerBand> sections{};             // Classic
+    std::array<Biquad, kMaxBiquadsPerBand> biquads{};              // Flat
+    int numBiquads = 0;                                            // 0 = Classic sections are in use
+
+    std::complex<double> response(std::complex<double> zInv) const {
+        const auto z2 = zInv * zInv;
+        std::complex<double> h = 1.0;
+        if (numBiquads > 0) {
+            for (int i = 0; i < numBiquads; ++i) {
+                const auto& q = biquads[static_cast<std::size_t>(i)];
+                h *= (q.b0 + q.b1 * zInv + q.b2 * z2) / (1.0 + q.a1 * zInv + q.a2 * z2);
+            }
+            return h;
+        }
+        const auto z3 = z2 * zInv, z4 = z2 * z2;
+        for (const auto& s : sections)
+            h *= (s.b0 + s.b2 * z2 + s.b4 * z4) / (1.0 + s.a1 * zInv + s.a2 * z2 + s.a3 * z3 + s.a4 * z4);
+        return h;
+    }
+};
+
+struct BandState {
+    std::array<SectionState, kSectionsPerBand> sections{};
+    std::array<BiquadState, kMaxBiquadsPerBand> biquads{};
+    void reset() {
+        for (auto& s : sections) s.reset();
+        for (auto& q : biquads) q.reset();
+    }
+};
+
+inline void appendBiquads(BandFilter& out, BiquadKind kind, double sampleRate, double hz, int times) {
+    for (int k = 0; k < times && out.numBiquads < kMaxBiquadsPerBand; ++k)
+        out.biquads[static_cast<std::size_t>(out.numBiquads++)] = designButterworthBiquad(kind, sampleRate, hz);
+}
+
+// Flat-mode split for one band from the three crossover edges (sorted, Hz).
+inline void designFlatBand(double sampleRate, const double edges[kBands + 1], int band, BandFilter& out) {
+    out.numBiquads = 0;
+    const double x1 = edges[1], x2 = edges[2], x3 = edges[3];
+    switch (band) {
+        case 0: appendBiquads(out, BiquadKind::LowPass, sampleRate, x1, 2); appendBiquads(out, BiquadKind::AllPass, sampleRate, x2, 1); appendBiquads(out, BiquadKind::AllPass, sampleRate, x3, 1); break;
+        case 1: appendBiquads(out, BiquadKind::HighPass, sampleRate, x1, 2); appendBiquads(out, BiquadKind::LowPass, sampleRate, x2, 2); appendBiquads(out, BiquadKind::AllPass, sampleRate, x3, 1); break;
+        case 2: appendBiquads(out, BiquadKind::HighPass, sampleRate, x1, 2); appendBiquads(out, BiquadKind::HighPass, sampleRate, x2, 2); appendBiquads(out, BiquadKind::LowPass, sampleRate, x3, 2); break;
+        default: appendBiquads(out, BiquadKind::HighPass, sampleRate, x1, 2); appendBiquads(out, BiquadKind::HighPass, sampleRate, x2, 2); appendBiquads(out, BiquadKind::HighPass, sampleRate, x3, 2); break;
+    }
+}
+
+// Flat-mode low and high cut (LR4 each). A high cut at or above 0.49 fs means "no cut" and is
+// left out so the top band stays flat to Nyquist.
+inline void designFlatCuts(double sampleRate, const double edges[kBands + 1], BandFilter& out) {
+    out.numBiquads = 0;
+    appendBiquads(out, BiquadKind::HighPass, sampleRate, edges[0], 2);
+    if (edges[kBands] < sampleRate * 0.49) appendBiquads(out, BiquadKind::LowPass, sampleRate, edges[kBands], 2);
+}
+
 inline float dbToGain(float db) {
     return static_cast<float>(std::pow(10.0, static_cast<double>(db) * 0.05));  // 10^(db/20)
 }
@@ -157,6 +274,16 @@ struct Ramp {
     }
 };
 
+// Per-band measurements since the last takeMeters(). heat is the saturation "differential":
+// energy of (shaped - linear) over energy of the linear signal, where linear is the band through
+// the curve's slope at zero. 0 = clean, approaches 1 under hard clipping, independent of level.
+struct BandMeters {
+    std::array<float, kBands> outPeak{}, heat{};
+};
+
+// Small-signal gain of a shape table; shapeLookup is linear in the first table step.
+inline float shapeSlopeAtZero(const float* table) { return table[1] * 254.0f; }
+
 class Engine {
 public:
     static constexpr int kEdgeUpdateInterval = 16;    // samples between coefficient updates while gliding
@@ -180,17 +307,56 @@ public:
         snapToTargets();
     }
 
-    // Pre-allocates band and ramp buffers for blocks up to n.
+    // Pre-allocates band, ramp and oversampling buffers for blocks up to n; larger blocks are chunked.
     void reserve(int n) {
+        if (n <= capacity_) return;
+        capacity_ = n;
         for (auto& band : scratch_)
-            for (auto& ch : band)
-                if (static_cast<int>(ch.size()) < n) ch.assign(static_cast<std::size_t>(n), 0.0f);
-        for (auto& r : rampBuf_)
-            if (static_cast<int>(r.size()) < n) r.assign(static_cast<std::size_t>(n), 0.0f);
+            for (auto& ch : band) ch.assign(static_cast<std::size_t>(n), 0.0f);
+        for (auto& r : rampBuf_) r.assign(static_cast<std::size_t>(n), 0.0f);
+        for (auto& ch : preBuf_) ch.assign(static_cast<std::size_t>(n), 0.0f);
+        osA_.assign(static_cast<std::size_t>(n * kMaxOsFactor), 0.0f);
+        osB_.assign(static_cast<std::size_t>(n * kMaxOsFactor), 0.0f);
     }
 
     void resetState() {
-        for (auto& band : state_) for (auto& ch : band) for (auto& s : ch) s.reset();
+        for (auto& band : state_) for (auto& ch : band) ch.reset();
+        for (auto& ch : cutState_) ch.reset();
+        resetOversamplers();
+    }
+
+    // Classic (Butterworth band-passes, as the original) or Flat (Linkwitz-Riley, bands sum
+    // flat). The two filter banks share no state, so switching redesigns and clears the bands.
+    void setCrossover(Crossover mode) {
+        if (mode == crossover_) return;
+        crossover_ = mode;
+        for (int b = 0; b < kBands; ++b) designBand(b, true, true);
+    }
+    Crossover crossover() const { return crossover_; }
+
+    // Oversampling around the waveshapers only: 0 = off, 1..3 = 2x/4x/8x. Switching resets the
+    // resampler memory, so it is a setup choice rather than something to automate.
+    void setOversampling(int stages) {
+        stages = std::clamp(stages, 0, kMaxOsStages);
+        if (stages == osStages_) return;
+        osStages_ = stages;
+        resetOversamplers();
+    }
+    int oversampling() const { return osStages_; }
+    int latencySamples() const { return os_.latency(osStages_); }
+
+    // Returns the peaks since the previous call and starts a new measurement.
+    BandMeters takeMeters() {
+        BandMeters m;
+        for (int b = 0; b < kBands; ++b) {
+            const auto i = static_cast<std::size_t>(b);
+            m.outPeak[i] = outPeak_[i];
+            m.heat[i] = linSq_[i] > 1e-9f ? diffSq_[i] / linSq_[i] : 0.0f;
+        }
+        outPeak_.fill(0.0f);
+        diffSq_.fill(0.0f);
+        linSq_.fill(0.0f);
+        return m;
     }
 
     // ---- immediate setters (no smoothing) ---------------------------------------------------
@@ -208,10 +374,11 @@ public:
         shapeFade_.snap(1.0f);
     }
 
-    // Sets one crossover edge (0..kBands) and redesigns the neighbouring bands.
+    // Sets one crossover edge (0..kBands) and redesigns the bands that depend on it.
     void setEdgeHz(int idx, float hz) {
         if (idx < 0 || idx > kBands) return;
         snapEdge(idx, static_cast<double>(hz));
+        if (crossover_ == Crossover::Flat) { for (int b = 0; b < kBands; ++b) designBand(b, true, true); return; }
         if (idx < kBands) designBand(idx, true, true);
         if (idx > 0) designBand(idx - 1, true, true);
     }
@@ -291,12 +458,12 @@ public:
     // Processes n samples per channel; in-place allowed.
     void process(const float* const* in, float* const* out, int n) {
         if (n <= 0) return;
-        if (static_cast<int>(scratch_[0][0].size()) < n || static_cast<int>(rampBuf_[0].size()) < n) reserve(n);
+        if (capacity_ <= 0) reserve(std::max(n, 64));   // only when prepare() was skipped
 
         int pos = 0;
         while (pos < n) {
             const bool gliding = edgesGliding();
-            const int len = gliding ? std::min(kEdgeUpdateInterval, n - pos) : n - pos;
+            const int len = std::min(gliding ? std::min(kEdgeUpdateInterval, n - pos) : n - pos, capacity_);
             if (gliding) advanceEdges(len);
             const float* ip[kMaxChannels] = {};
             float* op[kMaxChannels] = {};
@@ -314,10 +481,21 @@ public:
         return false;
     }
 
-    // Band filter sections for a given edge pair, as the engine applies them (for display).
-    static void designBandForDisplay(double sampleRate, double lo, double hi, std::array<Section, kSectionsPerBand>& out) {
+    // One band's filter for the given sorted edges, exactly as the engine would apply it (for
+    // display). In Flat mode the shared cuts are folded into every band.
+    static void designBandForDisplay(Crossover mode, double sampleRate, const double edges[kBands + 1], int band, BandFilter& out) {
+        if (mode == Crossover::Flat) {
+            designFlatBand(sampleRate, edges, band, out);
+            BandFilter cuts;
+            designFlatCuts(sampleRate, edges, cuts);
+            for (int i = 0; i < cuts.numBiquads; ++i)
+                out.biquads[static_cast<std::size_t>(out.numBiquads++)] = cuts.biquads[static_cast<std::size_t>(i)];
+            return;
+        }
+        out.numBiquads = 0;
+        double lo = edges[band], hi = edges[band + 1];
         applySetterClamps(sampleRate, lo, hi);
-        designBandpass(sampleRate, static_cast<float>(lo), static_cast<float>(hi), out);
+        designBandpass(sampleRate, static_cast<float>(lo), static_cast<float>(hi), out.sections);
     }
 
 private:
@@ -364,28 +542,46 @@ private:
     // Moves gliding edges by n samples and redesigns affected bands without clearing state.
     void advanceEdges(int n) {
         std::array<bool, kBands> dirty{};
+        bool any = false;
         for (int i = 0; i <= kBands; ++i) {
             edgeRamp_[static_cast<std::size_t>(i)].advance(n);
             if (applyEdge(i)) {
+                any = true;
                 if (i < kBands) dirty[static_cast<std::size_t>(i)] = true;
                 if (i > 0) dirty[static_cast<std::size_t>(i - 1)] = true;
             }
         }
+        // in Flat mode every band carries factors from several edges
+        if (any && crossover_ == Crossover::Flat) dirty.fill(true);
         for (int b = 0; b < kBands; ++b)
             if (dirty[static_cast<std::size_t>(b)]) designBand(b, true, false);
     }
 
     void processChunk(const float* const* in, float* const* out, int n) {
+        // Flat mode: low and high cut once, ahead of the split
+        const float* split[kMaxChannels];
+        for (int c = 0; c < channels_; ++c) {
+            split[c] = in[c];
+            if (crossover_ != Crossover::Flat || cuts_.numBiquads == 0) continue;
+            float* pre = preBuf_[static_cast<std::size_t>(c)].data();
+            for (int k = 0; k < cuts_.numBiquads; ++k)
+                runBiquad(cuts_.biquads[static_cast<std::size_t>(k)], cutState_[static_cast<std::size_t>(c)].biquads[static_cast<std::size_t>(k)], k == 0 ? in[c] : pre, pre, n);
+            split[c] = pre;
+        }
+
         // band split
         for (int b = 0; b < kBands; ++b)
             for (int c = 0; c < channels_; ++c) {
                 float* buf = scratch_[static_cast<std::size_t>(b)][static_cast<std::size_t>(c)].data();
-                for (int k = 0; k < kSectionsPerBand; ++k) {
-                    const float* src = (k == 0) ? in[c] : buf;
-                    runSection(sections_[static_cast<std::size_t>(b)][static_cast<std::size_t>(k)],
-                               state_[static_cast<std::size_t>(b)][static_cast<std::size_t>(c)][static_cast<std::size_t>(k)],
-                               src, buf, n);
+                const auto& f = filters_[static_cast<std::size_t>(b)];
+                auto& st = state_[static_cast<std::size_t>(b)][static_cast<std::size_t>(c)];
+                if (f.numBiquads > 0) {
+                    for (int k = 0; k < f.numBiquads; ++k)
+                        runBiquad(f.biquads[static_cast<std::size_t>(k)], st.biquads[static_cast<std::size_t>(k)], k == 0 ? split[c] : buf, buf, n);
+                    continue;
                 }
+                for (int k = 0; k < kSectionsPerBand; ++k)
+                    runSection(f.sections[static_cast<std::size_t>(k)], st.sections[static_cast<std::size_t>(k)], k == 0 ? split[c] : buf, buf, n);
             }
 
         // per-sample gain curves
@@ -400,6 +596,7 @@ private:
         // per-band waveshaper
         const float* table = kShapeTables[shape_];
         const float* prevTable = kShapeTables[prevShape_];
+        const float slope = shapeSlopeAtZero(table);
         for (int b = 0; b < kBands; ++b) {
             float* drv = rampBuf_[static_cast<std::size_t>(kBufDrive0 + b)].data();
             float* gn = rampBuf_[static_cast<std::size_t>(kBufGain0 + b)].data();
@@ -407,20 +604,34 @@ private:
             bandGain_[static_cast<std::size_t>(b)].fill(gn, n);
             for (int c = 0; c < channels_; ++c) {
                 float* buf = scratch_[static_cast<std::size_t>(b)][static_cast<std::size_t>(c)].data();
+                if (osStages_ > 0) {
+                    shapeOversampled(b, c, buf, n, inG, drv, outG, gn, mix, shapeFading, table, prevTable, slope);
+                    continue;
+                }
+                float pkOut = 0.0f, dsq = 0.0f, lsq = 0.0f;
                 if (!shapeFading) {
                     for (int i = 0; i < n; ++i) {
                         const float x = buf[i] * inG[i] * drv[i];
                         const float y = shapeLookup(table, x);
+                        const float lin = x * slope, d = y - lin;
+                        dsq += d * d;
+                        lsq += lin * lin;
                         buf[i] = y * outG[i] * compGain_ * gn[i];
+                        pkOut = std::max(pkOut, std::fabs(buf[i]));
                     }
                 } else {
                     for (int i = 0; i < n; ++i) {
                         const float x = buf[i] * inG[i] * drv[i];
                         const float yOld = shapeLookup(prevTable, x) * prevCompGain_;
-                        const float yNew = shapeLookup(table, x) * compGain_;
-                        buf[i] = (yOld + (yNew - yOld) * mix[i]) * outG[i] * gn[i];
+                        const float yn = shapeLookup(table, x);
+                        const float lin = x * slope, d = yn - lin;
+                        dsq += d * d;
+                        lsq += lin * lin;
+                        buf[i] = (yOld + (yn * compGain_ - yOld) * mix[i]) * outG[i] * gn[i];
+                        pkOut = std::max(pkOut, std::fabs(buf[i]));
                     }
                 }
+                meterBand(b, pkOut, dsq, lsq);
             }
         }
 
@@ -446,6 +657,71 @@ private:
                 dst[i] = acc;
             }
         }
+    }
+
+    // Gains are linear, so drive is applied at the base rate before upsampling and level after
+    // downsampling; only the lookup (and the shape crossfade) runs at the oversampled rate.
+    void shapeOversampled(int b, int c, float* buf, int n, const float* inG, const float* drv, const float* outG,
+                          const float* gn, const float* mix, bool shapeFading, const float* table, const float* prevTable,
+                          float slope) {
+        auto& states = osState_[static_cast<std::size_t>(b)][static_cast<std::size_t>(c)];
+        float pkOut = 0.0f, dsq = 0.0f, lsq = 0.0f;
+        for (int i = 0; i < n; ++i) buf[i] *= inG[i] * drv[i];
+
+        float* cur = osA_.data();
+        float* other = osB_.data();
+        int len = n;
+        upsample2(os_.stage[0], states[0], buf, cur, len);
+        len *= 2;
+        for (int s = 1; s < osStages_; ++s) {
+            upsample2(os_.stage[static_cast<std::size_t>(s)], states[static_cast<std::size_t>(s)], cur, other, len);
+            std::swap(cur, other);
+            len *= 2;
+        }
+
+        if (!shapeFading) {
+            for (int i = 0; i < len; ++i) {
+                const float x = cur[i];
+                const float y = shapeLookup(table, x);
+                const float lin = x * slope, d = y - lin;
+                dsq += d * d;
+                lsq += lin * lin;
+                cur[i] = y * compGain_;
+            }
+        } else {
+            for (int i = 0; i < len; ++i) {
+                const float x = cur[i];
+                const float yOld = shapeLookup(prevTable, x) * prevCompGain_;
+                const float yn = shapeLookup(table, x);
+                const float lin = x * slope, d = yn - lin;
+                dsq += d * d;
+                lsq += lin * lin;
+                cur[i] = yOld + (yn * compGain_ - yOld) * mix[i >> osStages_];
+            }
+        }
+
+        for (int s = osStages_ - 1; s >= 1; --s) {
+            len /= 2;
+            downsample2(os_.stage[static_cast<std::size_t>(s)], states[static_cast<std::size_t>(s)], cur, other, len);
+            std::swap(cur, other);
+        }
+        downsample2(os_.stage[0], states[0], cur, buf, n);
+        for (int i = 0; i < n; ++i) {
+            buf[i] *= outG[i] * gn[i];
+            pkOut = std::max(pkOut, std::fabs(buf[i]));
+        }
+        meterBand(b, pkOut, dsq, lsq);
+    }
+
+    void meterBand(int b, float outPeak, float diffSq, float linSq) {
+        const auto i = static_cast<std::size_t>(b);
+        outPeak_[i] = std::max(outPeak_[i], outPeak);
+        diffSq_[i] += diffSq;
+        linSq_[i] += linSq;
+    }
+
+    void resetOversamplers() {
+        for (auto& band : osState_) for (auto& ch : band) for (auto& s : ch) s.reset();
     }
 
     // Plain summing when no route crossfade is running.
@@ -480,15 +756,22 @@ private:
         lo = static_cast<double>(static_cast<float>(lo * 1.15));
     }
 
-    // viaSetter applies the preset clamps; clearState resets the band's filter memory.
+    // viaSetter applies the Classic preset clamps; clearState resets the band's filter memory.
     void designBand(int band, bool viaSetter, bool clearState) {
-        double lo = edges_[static_cast<std::size_t>(band)];
-        double hi = edges_[static_cast<std::size_t>(band + 1)];
-        if (viaSetter) applySetterClamps(sampleRate_, lo, hi);
-        designBandpass(sampleRate_, static_cast<float>(lo), static_cast<float>(hi),
-                       sections_[static_cast<std::size_t>(band)]);
+        auto& f = filters_[static_cast<std::size_t>(band)];
+        if (crossover_ == Crossover::Flat) {
+            designFlatBand(sampleRate_, edges_.data(), band, f);
+            designFlatCuts(sampleRate_, edges_.data(), cuts_);
+            if (clearState) for (auto& ch : cutState_) ch.reset();
+        } else {
+            f.numBiquads = 0;
+            double lo = edges_[static_cast<std::size_t>(band)];
+            double hi = edges_[static_cast<std::size_t>(band + 1)];
+            if (viaSetter) applySetterClamps(sampleRate_, lo, hi);
+            designBandpass(sampleRate_, static_cast<float>(lo), static_cast<float>(hi), f.sections);
+        }
         if (clearState)
-            for (auto& ch : state_[static_cast<std::size_t>(band)]) for (auto& s : ch) s.reset();
+            for (auto& ch : state_[static_cast<std::size_t>(band)]) ch.reset();
     }
 
     double sampleRate_ = 44100.0;
@@ -496,10 +779,20 @@ private:
     std::array<double, kBands + 1> edges_{};
     std::array<double, kBands + 1> edgeTargetHz_{};
     std::array<Ramp, kBands + 1> edgeRamp_{};
-    std::array<std::array<Section, kSectionsPerBand>, kBands> sections_{};
-    std::array<std::array<std::array<SectionState, kSectionsPerBand>, kMaxChannels>, kBands> state_{};
+    Crossover crossover_ = Crossover::Classic;
+    std::array<BandFilter, kBands> filters_{};
+    std::array<std::array<BandState, kMaxChannels>, kBands> state_{};
+    BandFilter cuts_{};                                            // Flat only
+    std::array<BandState, kMaxChannels> cutState_{};
+    std::array<std::vector<float>, kMaxChannels> preBuf_{};
     std::array<std::array<std::vector<float>, kMaxChannels>, kBands> scratch_{};
     std::array<std::vector<float>, kNumRampBufs> rampBuf_{};
+    int capacity_ = 0;
+    OsFilters os_;
+    std::array<std::array<std::array<HalfBandState, kMaxOsStages>, kMaxChannels>, kBands> osState_{};
+    std::vector<float> osA_, osB_;
+    int osStages_ = 0;
+    std::array<float, kBands> outPeak_{}, diffSq_{}, linSq_{};
     std::array<Ramp, kBands> bandGain_{{{1.f, 1.f}, {1.f, 1.f}, {1.f, 1.f}, {1.f, 1.f}}};
     std::array<Ramp, kBands> bandDrive_{{{1.f, 1.f}, {1.f, 1.f}, {1.f, 1.f}, {1.f, 1.f}}};
     std::array<Ramp, kBands> bandWeight_{{{1.f, 1.f}, {1.f, 1.f}, {1.f, 1.f}, {1.f, 1.f}}};

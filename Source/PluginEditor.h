@@ -10,6 +10,7 @@
 #include "gui/BandStrip.h"
 #include "gui/GlobalPanel.h"
 #include "gui/HelpBar.h"
+#include "gui/MeterDisplay.h"
 #include "gui/PresetBar.h"
 #include "gui/SpectrumBandView.h"
 #include "gui/TetraLookAndFeel.h"
@@ -36,11 +37,15 @@ private:
     void updateFftButtons();
     void updateSizeButton();
     void showSizeMenu();
+    void updateAnalyzerButton();
+    void showAnalyzerMenu();
     void setAboutVisible(bool);
     tdui::HelpInfo helpForComponent(juce::Component*) const;
 
     TetraDriveProcessor& proc_;
     tdui::TetraLookAndFeel lnf_;
+    tdui::MeterDisplay meters_;   // before the views that read it
+    double lastMeterTick_ = 0.0;
 
     juce::Rectangle<int> wordmark_;
     juce::DrawableButton info_{"About", juce::DrawableButton::ImageFitted};

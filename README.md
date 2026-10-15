@@ -7,8 +7,11 @@ TetraDrive is a faithful emulation of a popular multiband distortion unit from t
 ## Features
 
 * Four bands with independent Drive and Level, five waveshaper curves, Input and Output gain.
-* Live spectrum analyzer of the incoming signal (4096, 8192 or 16384 point FFT) with the bands drawn on top.
+* Oversampling (2x, 4x, 8x) around the waveshapers, with latency reported to the host.
+* Two crossover modes: Classic (the original band-pass split) and Flat (Linkwitz-Riley, bands sum flat).
+* Live spectrum analyzer (4096, 8192 or 16384 point FFT) of the input, the output or both, with the bands drawn on top.
 * Drag crossovers and band levels directly on the spectrum, real filter curves are shown for every band.
+* Metering: a saturation lamp per band (how much the shaper is changing the band), band level bars, and stereo input/output peak meters with clip indication.
 * Sample-accurate automation
 * Resizable interface
 * Help bar at the bottom explains the controls
@@ -60,7 +63,7 @@ User presets are stored as `*.tdpreset` files in:
 * Windows: `%APPDATA%\TetraDrive\Presets`
 * macOS: `~/Library/Application Support/TetraDrive/Presets`
 
-"Default" is built in. Solo and Bypass are not stored in presets.
+"Default" is built in. Solo, Bypass and Oversampling are not stored in presets.
 
 ## Parameters
 
@@ -74,9 +77,23 @@ User presets are stored as `*.tdpreset` files in:
 | Input, Output | -20 to +20 dB | 0 dB |
 | Shape | Shape 1-5 | Shape 1 |
 | Solo | Off, Low, Low Mid, High Mid, High | Off |
+| Oversampling | Off, 2x, 4x, 8x | 2x |
+| Crossover | Classic, Flat | Classic |
 | Bypass | off/on | off |
 
 Crossovers are kept in order with at least 1/12 octave between them, so automation can never flip the bands.
+
+## Crossover modes
+
+**Classic** splits the signal with fourth-order Butterworth band-pass filters, one per band, exactly as the original did. Neighbouring bands overlap at -3 dB, so with every band at 0 dB drive the sum has a little ripple around each crossover; part of the character.
+
+**Flat** uses Linkwitz-Riley (LR4) filters. Bands cross at -6 dB and each band carries all-pass stages matching the crossovers it does not take part in, so the four bands add back to a flat magnitude response. The low and high cuts are applied once ahead of the split, where they shape the whole signal without disturbing the band sum. Pick Flat when you want the band drives to behave like independent, additive distortion layers.
+
+Both modes use the same crossover frequencies, and the spectrum's band curves show whichever mode is active. Sessions saved before 1.1.0 load as Classic. The mode is stored in presets.
+
+## Oversampling
+
+Only the waveshapers run at the higher rate; the crossover filters stay at the host rate, so the band curves shown on the spectrum are exactly what you hear. Each band is upsampled with cascaded half-band polyphase filters, shaped, and downsampled again. Latency is 47, 55 or 58 samples for 2x, 4x and 8x and is reported to the host. Sessions saved before 1.1.0 load with oversampling off.
 
 ## Project layout
 
@@ -86,9 +103,10 @@ CMakeLists.txt        build definition
 external/JUCE/        JUCE 9.0.4 with a small VST3 patch (see below)
 patches/              that patch as a diff
 resources/            About page text, Inter font, SVG icons
-src/                  DSP engine, parameter definitions, waveshaper tables
+src/                  DSP engine, oversampling, parameter definitions, waveshaper tables
 Source/               JUCE processor, presets, spectrum analyzer
 Source/gui/           interface components
+tests/                headless engine tests (-DTD_BUILD_TESTS=ON, no JUCE needed)
 ```
 
 ## Versioning

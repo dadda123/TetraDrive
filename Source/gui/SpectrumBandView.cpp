@@ -3,6 +3,7 @@
 #include <complex>
 
 #include "../PluginProcessor.h"
+#include "MeterDisplay.h"
 #include "TetraLookAndFeel.h"
 
 namespace tdui {
@@ -17,19 +18,10 @@ const char* edgeHint(int e) {
                                        : "Drag to move the crossover. Shift = fine. Double-click = reset.";
 }
 
-std::complex<double> sectionResponse(const td::Section& s, std::complex<double> zInv) {
-    const auto z2 = zInv * zInv;
-    const auto z3 = z2 * zInv;
-    const auto z4 = z2 * z2;
-    const auto num = s.b0 + s.b2 * z2 + s.b4 * z4;
-    const auto den = 1.0 + s.a1 * zInv + s.a2 * z2 + s.a3 * z3 + s.a4 * z4;
-    return num / den;
-}
-
 }  // namespace
 
-SpectrumBandView::SpectrumBandView(TetraDriveProcessor& p)
-    : proc_(p), vblank_(this, [this](double ts) { tick(ts); }) {
+SpectrumBandView::SpectrumBandView(TetraDriveProcessor& p, const MeterDisplay& meters)
+    : proc_(p), meters_(meters), vblank_(this, [this](double ts) { tick(ts); }) {
     setOpaque(true);
     setRepaintsOnMouseActivity(false);
 }
@@ -77,50 +69,68 @@ void SpectrumBandView::resized() {
     for (int i = 0; i < points; ++i)
         freqs_[static_cast<std::size_t>(i)] = kFreqMin * std::pow(kFreqMax / kFreqMin, static_cast<float>(i) / static_cast<float>(points - 1));
     proc_.analyzer.resetDisplay();
+    proc_.analyzerOut.resetDisplay();
     curveKey_.clear();
     rebuildCurves();
-    rebuildSpectrumPath();
+    rebuildSpectrumPaths();
 }
 
 // ---- animation --------------------------------------------------------------------------------
 
+void SpectrumBandView::updateAnalyzer(SpectrumAnalyzer& analyzer, bool show, std::vector<float>& db, double dt) {
+    if (show) {
+        analyzer.setOrder(proc_.ui.fftOrder.load());
+        analyzer.update(freqs_, db, dt);
+        return;
+    }
+    analyzer.drain();
+    if (!db.empty()) { db.clear(); analyzer.resetDisplay(); }
+}
+
 void SpectrumBandView::tick(double ts) {
     const double dt = lastTs_ > 0.0 ? ts - lastTs_ : 1.0 / 60.0;
     lastTs_ = ts;
-    bool dirty = false;
 
     const bool on = proc_.ui.analyzerOn.load();
-    if (on) {
-        proc_.analyzer.setOrder(proc_.ui.fftOrder.load());
-        proc_.analyzer.update(freqs_, specDb_, dt);
-        rebuildSpectrumPath();
-        dirty = true;
-    } else if (analyzerWasOn_) {
-        specDb_.clear();
-        rebuildSpectrumPath();
-        dirty = true;
-    }
-    analyzerWasOn_ = on;
+    const int source = proc_.ui.analyzerSource.load();
+    const bool wasShowing = showIn_ || showOut_;
+    showIn_ = on && source != TetraDriveProcessor::kAnalyzeOutput;
+    showOut_ = on && source != TetraDriveProcessor::kAnalyzeInput;
+    updateAnalyzer(proc_.analyzer, showIn_, inDb_, dt);
+    updateAnalyzer(proc_.analyzerOut, showOut_, outDb_, dt);
+    bool dirty = showIn_ || showOut_ || wasShowing;
+    if (dirty) rebuildSpectrumPaths();
 
     const auto before = curveKey_;
     rebuildCurves();
     dirty |= before != curveKey_;
+    for (int b = 0; b < td::kBands; ++b) {
+        const int q = juce::roundToInt(meters_.bandSaturation(b) * 48.0f);
+        if (q != shownSaturation_[static_cast<std::size_t>(b)]) { shownSaturation_[static_cast<std::size_t>(b)] = q; dirty = true; }
+    }
     if (dirty) repaint();
 }
 
-void SpectrumBandView::rebuildSpectrumPath() {
-    specFill_.clear();
-    specLine_.clear();
-    if (specDb_.size() != freqs_.size() || freqs_.empty()) return;
+void SpectrumBandView::buildSpectrumPath(const std::vector<float>& db, juce::Path& fill, juce::Path& line) const {
+    fill.clear();
+    line.clear();
+    if (db.size() != freqs_.size() || freqs_.empty()) return;
+    line.preallocateSpace(static_cast<int>(freqs_.size()) * 3 + 8);
+    fill.preallocateSpace(static_cast<int>(freqs_.size()) * 3 + 16);
     for (std::size_t i = 0; i < freqs_.size(); ++i) {
         const float x = freqToX(freqs_[i]);
-        const float y = juce::jlimit(plot_.getY(), plot_.getBottom(), specDbToY(specDb_[i]));
-        if (i == 0) { specLine_.startNewSubPath(x, y); specFill_.startNewSubPath(x, plot_.getBottom()); }
-        else specLine_.lineTo(x, y);
-        specFill_.lineTo(x, y);
+        const float y = juce::jlimit(plot_.getY(), plot_.getBottom(), specDbToY(db[i]));
+        if (i == 0) { line.startNewSubPath(x, y); fill.startNewSubPath(x, plot_.getBottom()); }
+        else line.lineTo(x, y);
+        fill.lineTo(x, y);
     }
-    specFill_.lineTo(plot_.getRight(), plot_.getBottom());
-    specFill_.closeSubPath();
+    fill.lineTo(plot_.getRight(), plot_.getBottom());
+    fill.closeSubPath();
+}
+
+void SpectrumBandView::rebuildSpectrumPaths() {
+    buildSpectrumPath(inDb_, inFill_, inLine_);
+    buildSpectrumPath(outDb_, outFill_, outLine_);
 }
 
 void SpectrumBandView::rebuildCurves() {
@@ -131,16 +141,20 @@ void SpectrumBandView::rebuildCurves() {
     std::sort(e.begin(), e.end());
     for (float v : e) key.push_back(v);
     for (int b = 0; b < td::kBands; ++b) key.push_back(proc_.realValue(td::levelParam(b)));
+    const auto mode = std::lround(proc_.realValue(td::kCrossover)) == 1 ? td::Crossover::Flat : td::Crossover::Classic;
+    key.push_back(static_cast<float>(mode));
     key.push_back(static_cast<float>(sr));
     key.push_back(plot_.getWidth());
     key.push_back(plot_.getHeight());
     if (key == curveKey_) return;
     curveKey_ = key;
 
-    std::array<std::array<td::Section, td::kSectionsPerBand>, td::kBands> sections{};
+    std::array<double, td::kBands + 1> edges{};
+    for (int i = 0; i <= td::kBands; ++i) edges[static_cast<std::size_t>(i)] = e[static_cast<std::size_t>(i)];
+    std::array<td::BandFilter, td::kBands> filters{};
     std::array<double, td::kBands> gains{};
     for (int b = 0; b < td::kBands; ++b) {
-        td::Engine::designBandForDisplay(sr, e[static_cast<std::size_t>(b)], e[static_cast<std::size_t>(b + 1)], sections[static_cast<std::size_t>(b)]);
+        td::Engine::designBandForDisplay(mode, sr, edges.data(), b, filters[static_cast<std::size_t>(b)]);
         gains[static_cast<std::size_t>(b)] = std::pow(10.0, proc_.realValue(td::levelParam(b)) / 20.0);
     }
 
@@ -155,8 +169,7 @@ void SpectrumBandView::rebuildCurves() {
         const std::complex<double> zInv = std::polar(1.0, -w);
         std::complex<double> sum{};
         for (int b = 0; b < td::kBands; ++b) {
-            std::complex<double> h = gains[static_cast<std::size_t>(b)];
-            for (const auto& sec : sections[static_cast<std::size_t>(b)]) h *= sectionResponse(sec, zInv);
+            const std::complex<double> h = gains[static_cast<std::size_t>(b)] * filters[static_cast<std::size_t>(b)].response(zInv);
             sum += h;
             const float y = juce::jlimit(plot_.getY() - 2.0f, plot_.getBottom() + 2.0f,
                                          bandDbToY(static_cast<float>(20.0 * std::log10(std::abs(h) + 1e-9))));
@@ -210,12 +223,23 @@ void SpectrumBandView::paint(juce::Graphics& g) {
     g.fillRect(plot_.withRight(freqToX(e[0])));
     g.fillRect(plot_.withLeft(freqToX(e[td::kBands])));
 
-    // spectrum
-    if (!specLine_.isEmpty()) {
-        g.setColour(colours::spectrumFill);
-        g.fillPath(specFill_);
-        g.setColour(colours::spectrumLine);
-        g.strokePath(specLine_, juce::PathStrokeType(1.0f));
+    // spectrum: on its own either trace is filled; together the output is filled and the input
+    // becomes a muted outline so the added harmonics read as the difference between the two
+    const bool both = !inLine_.isEmpty() && !outLine_.isEmpty();
+    if (!outLine_.isEmpty()) {
+        g.setColour(both ? colours::spectrumOutputFill : colours::spectrumFill);
+        g.fillPath(outFill_);
+        g.setColour(both ? colours::spectrumOutputLine : colours::spectrumLine);
+        g.strokePath(outLine_, juce::PathStrokeType(both ? 1.25f : 1.0f));
+    }
+    if (!inLine_.isEmpty()) {
+        if (!both) {
+            g.setColour(colours::spectrumFill);
+            g.fillPath(inFill_);
+        }
+        // drawn last so the input stays legible inside the output's fill
+        g.setColour(both ? colours::spectrumInputDim : colours::spectrumLine);
+        g.strokePath(inLine_, juce::PathStrokeType(1.0f));
     }
 
     // band and sum curves
@@ -251,15 +275,24 @@ void SpectrumBandView::paint(juce::Graphics& g) {
         juce::Path ringTrack, ring;
         ringTrack.addCentredArc(c.x, c.y, ringR, ringR, 0.0f, -2.4f, 2.4f, true);
         ring.addCentredArc(c.x, c.y, ringR, ringR, 0.0f, -2.4f, -2.4f + 4.8f * driveNorm, true);
+        // the puck glows as the band is driven into its curve
+        const float sat = meters_.bandSaturation(b);
+        if (sat > 0.0f) {
+            const float glowR = ringR + (3.0f + 9.0f * sat) * s;
+            juce::ColourGradient glow(colour.withAlpha(0.38f * sat), c.x, c.y, colour.withAlpha(0.0f), c.x + glowR, c.y, true);
+            g.setGradientFill(glow);
+            g.fillEllipse(juce::Rectangle<float>(2 * glowR, 2 * glowR).withCentre(c));
+        }
         g.setColour(colours::outline);
         g.strokePath(ringTrack, juce::PathStrokeType(2.0f * s));
         g.setColour(colour);
         g.strokePath(ring, juce::PathStrokeType(2.0f * s));
-        g.setColour(active ? colour : colours::panelRaised);
+        const bool lit = active || sat > 0.55f;
+        g.setColour(active ? colour : colours::panelRaised.interpolatedWith(colour, sat));
         g.fillEllipse(juce::Rectangle<float>(2 * r, 2 * r).withCentre(c));
         g.setColour(active ? colours::focus : colour);
         g.drawEllipse(juce::Rectangle<float>(2 * r, 2 * r).withCentre(c), 2.0f);
-        g.setColour(active ? colours::background : colours::textPrimary);
+        g.setColour(lit ? colours::background : colours::textPrimary);
         g.setFont(TetraLookAndFeel::font(10.5f * s, Weight::SemiBold));
         g.drawText(juce::String(b + 1), juce::Rectangle<float>(2 * r, 2 * r).withCentre(c), juce::Justification::centred);
     }
@@ -288,11 +321,27 @@ void SpectrumBandView::paint(juce::Graphics& g) {
     }
     g.drawText("dB", juce::Rectangle<float>(plot_.getRight() + 6.0f * s, plot_.getBottom() - 16.0f * s, 40.0f * s, 16.0f * s), juce::Justification::centredLeft);
 
-    // caption
-    if (proc_.ui.analyzerOn.load()) {
-        g.setFont(TetraLookAndFeel::font(11.0f * s));
-        g.setColour(colours::textSecondary);
-        g.drawText("Input spectrum +3 dB/oct tilt", plot_.reduced(8.0f * s, 6.0f * s).removeFromTop(16.0f * s), juce::Justification::topLeft);
+    // legend
+    if (showIn_ || showOut_) {
+        const auto font = TetraLookAndFeel::font(11.0f * s);
+        g.setFont(font);
+        float x = plot_.getX() + 8.0f * s;
+        const float y = plot_.getY() + 6.0f * s, h = 16.0f * s;
+        auto item = [&](juce::Colour swatch, const juce::String& label) {
+            g.setColour(swatch);
+            g.fillRect(x, y + h * 0.5f - 1.0f * s, 12.0f * s, 2.0f * s);
+            x += 16.0f * s;
+            juce::GlyphArrangement ga;
+            ga.addLineOfText(font, label, 0.0f, 0.0f);
+            const float w = ga.getBoundingBox(0, -1, true).getWidth() + 2.0f * s;
+            g.setColour(colours::textSecondary);
+            g.drawText(label, juce::Rectangle<float>(x, y, w, h), juce::Justification::centredLeft);
+            x += w + 10.0f * s;
+        };
+        if (showIn_) item(showOut_ ? colours::spectrumInputDim : colours::spectrumLine, "Input");
+        if (showOut_) item(showIn_ ? colours::spectrumOutputLine : colours::spectrumLine, "Output");
+        g.setColour(colours::textSecondary.withAlpha(0.7f));
+        g.drawText("+3 dB/oct tilt", juce::Rectangle<float>(x, y, 100.0f * s, h), juce::Justification::centredLeft);
     }
 
     // value label for the hovered or dragged target
@@ -355,7 +404,7 @@ HelpInfo SpectrumBandView::helpFor(const Target& t) const {
         h.description = "Drag up/down = Level. Alt/Ctrl-drag or wheel = Drive. Shift = fine. Double-click = reset. Right-click = Solo.";
     } else {
         h.title = "Spectrum";
-        h.description = "Live input spectrum with the four bands on top. Drag the lines to move crossovers, drag the numbered pucks to set band level.";
+        h.description = "Live input and output spectrum with the four bands on top. Drag the lines to move crossovers, drag the numbered pucks to set band level.";
     }
     return h;
 }

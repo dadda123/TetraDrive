@@ -27,7 +27,7 @@ enum ParamIndex : int {
     kLowCut, kXover1, kXover2, kXover3, kHighCut,
     kDrive1, kDrive2, kDrive3, kDrive4,
     kLevel1, kLevel2, kLevel3, kLevel4,
-    kInput, kOutput, kShape, kSolo,
+    kInput, kOutput, kShape, kSolo, kOversample, kCrossover,
     kNumParams
 };
 
@@ -67,10 +67,16 @@ inline constexpr std::array<ParamSpec, kNumParams> kParams{{
      "Waveshaper curve used by every band."},
     {"solo", "Solo", "Solo", Unit::Choice, 0.0f, 4.0f, 0.0f, 1.0f, false,
      "Listen to one band on its own."},
+    {"oversample", "Oversampling", "OS", Unit::Choice, 0.0f, 3.0f, 1.0f, 1.0f, false,
+     "Runs the waveshapers at a higher rate to reduce aliasing. Higher settings cost more CPU and add latency, which is reported to the host."},
+    {"crossover", "Crossover", "X-Over", Unit::Choice, 0.0f, 1.0f, 0.0f, 1.0f, false,
+     "Classic splits the bands like the original hardware, with a little ripple where they meet. Flat uses Linkwitz-Riley filters so the bands add back to a flat response."},
 }};
 
 inline constexpr std::array<const char*, kShapeCount> kShapeNames{{"Shape 1", "Shape 2", "Shape 3", "Shape 4", "Shape 5"}};
 inline constexpr std::array<const char*, kBands + 1> kSoloNames{{"Off", "Low", "Low Mid", "High Mid", "High"}};
+inline constexpr std::array<const char*, kMaxOsStages + 1> kOversampleNames{{"Off", "2x", "4x", "8x"}};
+inline constexpr std::array<const char*, 2> kCrossoverNames{{"Classic", "Flat"}};
 inline constexpr std::array<const char*, kBands> kBandNames{{"Low", "Low Mid", "High Mid", "High"}};
 
 inline int driveParam(int band) { return kDrive1 + band; }
@@ -105,6 +111,8 @@ inline std::string formatValue(int index, float value) {
             const int i = static_cast<int>(std::lround(value));
             if (index == kShape && i >= 0 && i < kShapeCount) return kShapeNames[static_cast<std::size_t>(i)];
             if (index == kSolo && i >= 0 && i <= kBands) return kSoloNames[static_cast<std::size_t>(i)];
+            if (index == kOversample && i >= 0 && i <= kMaxOsStages) return kOversampleNames[static_cast<std::size_t>(i)];
+            if (index == kCrossover && i >= 0 && i <= 1) return kCrossoverNames[static_cast<std::size_t>(i)];
             return std::to_string(i);
         }
     }

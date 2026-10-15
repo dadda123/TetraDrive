@@ -1,5 +1,7 @@
 #include "PluginEditor.h"
 
+#include "gui/Logo.h"
+
 using namespace tdui;
 
 namespace {
@@ -12,7 +14,7 @@ constexpr SizePreset kSizes[] = {{"Small", 760, 480}, {"Medium", 1000, 640}, {"L
 }  // namespace
 
 TetraDriveEditor::TetraDriveEditor(TetraDriveProcessor& p)
-    : AudioProcessorEditor(p), proc_(p), presetBar_(p), spectrum_(p), global_(p) {
+    : AudioProcessorEditor(p), proc_(p), presetBar_(p), spectrum_(p, meters_), global_(p, meters_) {
     setLookAndFeel(&lnf_);
 
     // top bar
@@ -56,11 +58,11 @@ TetraDriveEditor::TetraDriveEditor(TetraDriveProcessor& p)
         };
         addAndMakeVisible(b);
     }
-    analyzer_.setClickingTogglesState(true);
-    analyzer_.setToggleState(proc_.ui.analyzerOn.load(), juce::dontSendNotification);
-    describe(analyzer_, "Analyzer", "Show or hide the live input spectrum behind the bands.");
-    analyzer_.onClick = [this] { proc_.ui.analyzerOn = analyzer_.getToggleState(); };
+    analyzer_.setClickingTogglesState(false);
+    describe(analyzer_, "Analyzer", "Choose what the live spectrum shows: the input, the output, or both. With both, the output is drawn bright over a muted input so the harmonics each band adds stand out.");
+    analyzer_.onClick = [this] { showAnalyzerMenu(); };
     addAndMakeVisible(analyzer_);
+    updateAnalyzerButton();
     updateFftButtons();
 
     // main area
@@ -71,7 +73,7 @@ TetraDriveEditor::TetraDriveEditor(TetraDriveProcessor& p)
     };
     addAndMakeVisible(spectrum_);
     for (int b = 0; b < td::kBands; ++b) {
-        strips_[static_cast<std::size_t>(b)] = std::make_unique<BandStrip>(p, b);
+        strips_[static_cast<std::size_t>(b)] = std::make_unique<BandStrip>(p, b, meters_);
         addAndMakeVisible(*strips_[static_cast<std::size_t>(b)]);
     }
     addAndMakeVisible(global_);
@@ -102,9 +104,7 @@ TetraDriveEditor::~TetraDriveEditor() {
 void TetraDriveEditor::paint(juce::Graphics& g) {
     const float s = lnf_.getScale();
     g.fillAll(colours::background);
-    g.setColour(colours::textPrimary);
-    g.setFont(TetraLookAndFeel::font(19.0f * s, Weight::SemiBold));
-    g.drawText("TetraDrive", wordmark_, juce::Justification::centredLeft);
+    logo::drawWordmark(g, wordmark_.toFloat(), 19.0f * s);
 }
 
 void TetraDriveEditor::resized() {
@@ -120,8 +120,9 @@ void TetraDriveEditor::resized() {
     about_.setBounds(r);
 
     // top bar
-    auto top = r.removeFromTop(px(46.0f)).reduced(px(12.0f), px(8.0f));
-    wordmark_ = top.removeFromLeft(px(112.0f));
+    auto top = r.removeFromTop(px(46.0f)).reduced(px(12.0f), px(6.0f));
+    wordmark_ = top.removeFromLeft(juce::roundToInt(logo::wordmarkWidth(static_cast<float>(top.getHeight()), 19.0f * s)) + px(4.0f));
+    top = top.reduced(0, px(2.0f));
     info_.setBounds(top.removeFromLeft(px(22.0f)).withSizeKeepingCentre(px(18.0f), px(18.0f)));
     top.removeFromLeft(px(16.0f));
     help_.setBounds(top.removeFromRight(px(22.0f)).withSizeKeepingCentre(px(18.0f), px(18.0f)));
@@ -173,6 +174,36 @@ void TetraDriveEditor::showSizeMenu() {
         m.addItem(juce::PopupMenu::Item(text).setTicked(getWidth() == w && getHeight() == h).setAction([this, w, h] { setSize(w, h); }));
     }
     m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&size_));
+}
+
+namespace {
+constexpr const char* kAnalyzerSourceNames[] = {"Input", "Output", "Input + Output"};
+constexpr const char* kAnalyzerSourceShort[] = {"In", "Out", "In + Out"};
+}  // namespace
+
+void TetraDriveEditor::updateAnalyzerButton() {
+    const bool on = proc_.ui.analyzerOn.load();
+    const int source = juce::jlimit(0, 2, proc_.ui.analyzerSource.load());
+    analyzer_.setToggleState(on, juce::dontSendNotification);
+    analyzer_.setButtonText(on ? kAnalyzerSourceShort[source] : "Analyzer");
+}
+
+void TetraDriveEditor::showAnalyzerMenu() {
+    juce::PopupMenu m;
+    m.addSectionHeader("Analyzer");
+    const bool on = proc_.ui.analyzerOn.load();
+    const int source = proc_.ui.analyzerSource.load();
+    m.addItem(juce::PopupMenu::Item("Off").setTicked(!on).setAction([this] {
+        proc_.ui.analyzerOn = false;
+        updateAnalyzerButton();
+    }));
+    for (int i = 0; i < 3; ++i)
+        m.addItem(juce::PopupMenu::Item(kAnalyzerSourceNames[i]).setTicked(on && source == i).setAction([this, i] {
+            proc_.ui.analyzerOn = true;
+            proc_.ui.analyzerSource = i;
+            updateAnalyzerButton();
+        }));
+    m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&analyzer_));
 }
 
 void TetraDriveEditor::updateFftButtons() {
@@ -230,12 +261,15 @@ void TetraDriveEditor::mouseUp(const juce::MouseEvent& e) {
 }
 
 void TetraDriveEditor::timerCallback() {
+    const double now = juce::Time::getMillisecondCounterHiRes() * 0.001;
+    meters_.update(proc_.meters, lastMeterTick_ > 0.0 ? now - lastMeterTick_ : 1.0 / 30.0);
+    lastMeterTick_ = now;
     for (auto& strip : strips_) strip->refresh();
+    global_.refresh();
     presetBar_.refresh();
     updateFftButtons();
     if (help_.getToggleState() != proc_.ui.helpBar.load())
         help_.setToggleState(proc_.ui.helpBar.load(), juce::dontSendNotification);
-    if (analyzer_.getToggleState() != proc_.ui.analyzerOn.load())
-        analyzer_.setToggleState(proc_.ui.analyzerOn.load(), juce::dontSendNotification);
+    updateAnalyzerButton();
     if (helpTarget_ != nullptr && !spectrumHelpActive_) helpBar_.setInfo(helpForComponent(helpTarget_.getComponent()));
 }

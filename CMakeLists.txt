@@ -87,7 +87,8 @@ set(TD_PLUGIN_SOURCES
     Source/gui/GlobalPanel.cpp
     Source/gui/PresetBar.cpp
     Source/gui/HelpBar.cpp
-    Source/gui/AboutPanel.cpp)
+    Source/gui/AboutPanel.cpp
+    Source/gui/Logo.cpp)
 
 target_sources(TetraDrive PRIVATE ${TD_PLUGIN_SOURCES})
 target_include_directories(TetraDrive PRIVATE src Source)
@@ -111,3 +112,17 @@ target_link_libraries(TetraDrive
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags)
+
+# Headless engine tests (no JUCE): cmake -DTD_BUILD_TESTS=ON, then ctest or run td_engine_test.
+option(TD_BUILD_TESTS "Build the headless engine tests" OFF)
+if(TD_BUILD_TESTS)
+    add_executable(td_engine_test tests/EngineTest.cpp)
+    target_include_directories(td_engine_test PRIVATE src)
+    if(MSVC)
+        target_compile_options(td_engine_test PRIVATE /W4)
+    else()
+        target_compile_options(td_engine_test PRIVATE -Wall -Wextra -Wconversion -Wsign-conversion)
+    endif()
+    enable_testing()
+    add_test(NAME td_engine_test COMMAND td_engine_test)
+endif()

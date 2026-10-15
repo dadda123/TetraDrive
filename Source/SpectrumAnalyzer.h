@@ -32,9 +32,13 @@ public:
     // Returns true when new audio arrived.
     bool update(const std::vector<float>& freqs, std::vector<float>& db, double dtSeconds);
 
+    // GUI thread: keeps the history current while this analyzer is not displayed.
+    void drain() { drainFifo(); }
+
     void resetDisplay() { display_.clear(); }
 
 private:
+    int drainFifo();
     void rebuildMap(const std::vector<float>& freqs);
 
     std::atomic<double> sampleRate_{44100.0};

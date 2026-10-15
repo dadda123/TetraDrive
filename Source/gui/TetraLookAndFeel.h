@@ -18,7 +18,13 @@ inline const juce::Colour textSecondary{0xff9aa4b2};
 inline const juce::Colour focus{0xffe8ecf2};
 inline const juce::Colour spectrumFill{0x33e8ecf2};
 inline const juce::Colour spectrumLine{0xb3c9d1dc};
+// When input and output are shown together the input steps back to a muted outline.
+inline const juce::Colour spectrumInputDim{0x998a9ab0};
+inline const juce::Colour spectrumOutputLine{0xf2f4f7fa};
+inline const juce::Colour spectrumOutputFill{0x2ee8ecf2};
 inline const juce::Colour sumCurve{0xffd5dbe3};
+inline const juce::Colour meterFill{0xffb8c2cf};
+inline const juce::Colour clip{0xffe35d5d};
 inline const std::array<juce::Colour, 4> bands{{juce::Colour{0xff3ec6e0}, juce::Colour{0xff5dd39e},
                                                 juce::Colour{0xfff2b33d}, juce::Colour{0xffe15fb0}}};
 }  // namespace colours

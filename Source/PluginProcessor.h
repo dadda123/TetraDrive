@@ -5,16 +5,19 @@
 #include <array>
 #include <atomic>
 
+#include "LiveMeters.h"
 #include "PresetManager.h"
 #include "SampleAccurateEvents.h"
 #include "SpectrumAnalyzer.h"
 #include "td_dsp.h"
 #include "td_params.h"
 
-class TetraDriveProcessor : public juce::AudioProcessor, public juce::SampleAccurateParameterSink {
+class TetraDriveProcessor : public juce::AudioProcessor,
+                            public juce::SampleAccurateParameterSink,
+                            private juce::AsyncUpdater {
 public:
     TetraDriveProcessor();
-    ~TetraDriveProcessor() override = default;
+    ~TetraDriveProcessor() override { cancelPendingUpdate(); }
 
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
@@ -51,14 +54,19 @@ public:
     double currentSampleRate() const { return sampleRate_.load(); }
 
     juce::AudioProcessorValueTreeState apvts;
-    SpectrumAnalyzer analyzer;
+    SpectrumAnalyzer analyzer;      // input, before processing
+    SpectrumAnalyzer analyzerOut;   // output, after processing
+    LiveMeters meters;
     PresetManager presets;
+
+    enum AnalyzerSource : int { kAnalyzeInput = 0, kAnalyzeOutput = 1, kAnalyzeBoth = 2 };
 
     // Editor settings stored with the session.
     struct UiState {
         std::atomic<int> width{1000}, height{640};
         std::atomic<int> fftOrder{13};
         std::atomic<bool> analyzerOn{true};
+        std::atomic<int> analyzerSource{kAnalyzeBoth};
         std::atomic<bool> helpBar{true};
     } ui;
 
@@ -70,7 +78,10 @@ private:
     void applyParam(int index, float normalised, int rampSamples);
     void pushEdges(int rampSamples);
     void processInternal(juce::AudioBuffer<float>&, bool forceBypass);
+    static void pushChannelPeaks(std::array<PeakAtomic, td::kMaxChannels>&, const juce::AudioBuffer<float>&, int channels, int n);
     void syncAllParams(bool snap);
+    // Latency changes with the oversampling factor; the host is told from the message thread.
+    void handleAsyncUpdate() override { setLatencySamples(engine_.latencySamples()); }
 
     td::Engine engine_;
     std::array<juce::RangedAudioParameter*, td::kNumParams> params_{};
