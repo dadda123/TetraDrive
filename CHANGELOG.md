@@ -3,6 +3,7 @@
 Add a new `## [x.y.z] - YYYY-MM-DD` section at the top for every release. The topmost version is the plug-in version.
 
 ## [1.1.0] - 2026-10-15
+- Thanks to Steve Duda (Xfer Records) for contributing all of the 1.1.0 features below.
 - Added: Oversampling (Off, 2x, 4x, 8x) in the Global panel. The waveshapers run at the higher rate; crossovers and the sound of each shape are unchanged. Latency is reported to the host.
 - Sessions saved with 1.0.0 load with oversampling off, so they recall exactly as before. New instances default to 2x.
 - Oversampling is not stored in presets.

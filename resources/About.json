@@ -3,7 +3,7 @@
   "tagline": "Four-band multiband distortion",
   "description": "TetraDrive splits your signal into four frequency bands and drives each one through its own waveshaper. Shape the lows, mids and highs independently, then blend them back together for anything from subtle warmth to full-on fuzz. Drag the crossovers right on the live spectrum to hear exactly what each band does.",
   "link": { "label": "daddasounds.com", "url": "https://daddasounds.com" },
-  "credits": "Made by Dadda",
+  "credits": "Made by Dadda. Version 1.1 features by Steve Duda (Xfer Records)",
 "licenses": [
   { "title": "TetraDrive", "text": "Licensed under the GNU Affero General Public License v3 (AGPLv3). Source code: https://github.com/dadda123/TetraDrive" },
   { "title": "JUCE", "text": "Built with JUCE 9 (juce.com), used under the AGPLv3." },

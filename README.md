@@ -95,6 +95,11 @@ Both modes use the same crossover frequencies, and the spectrum's band curves sh
 
 Only the waveshapers run at the higher rate; the crossover filters stay at the host rate, so the band curves shown on the spectrum are exactly what you hear. Each band is upsampled with cascaded half-band polyphase filters, shaped, and downsampled again. Latency is 47, 55 or 58 samples for 2x, 4x and 8x and is reported to the host. Sessions saved before 1.1.0 load with oversampling off.
 
+## Credits
+
+* Made by Dadda.
+* Version 1.1.0 (oversampling, Flat crossover, metering, output analyzer and the animated logo) was contributed by Steve Duda / Xfer Records.
+
 ## Project layout
 
 ```
