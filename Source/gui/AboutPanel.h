@@ -3,9 +3,11 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
+#include "Logo.h"
+
 namespace tdui {
 
-class AboutPanel : public juce::Component {
+class AboutPanel : public juce::Component, private juce::Timer {
 public:
     AboutPanel();
     ~AboutPanel() override;
@@ -25,7 +27,13 @@ public:
 private:
     class TextPage;
     juce::Rectangle<int> cardBounds() const;
+    juce::Rectangle<float> glyphBounds() const;
     void rebuildPages();
+    void timerCallback() override;
+
+    // the logo draws itself in whenever the panel opens, then keeps gently moving
+    logo::Animator logoAnimator_;
+    double openedAtMs_ = 0.0;
 
     juce::var about_;
     juce::String changelog_;

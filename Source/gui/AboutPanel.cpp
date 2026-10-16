@@ -3,11 +3,14 @@
 #include <BinaryData.h>
 
 #include "../PluginProcessor.h"
+#include "Logo.h"
 #include "TetraLookAndFeel.h"
 
 namespace tdui {
 
 namespace {
+
+constexpr float kHeadHeight = 96.0f;   // logo size; the name block is centred against it
 
 juce::String resourceText(const char* name) {
     int size = 0;
@@ -96,7 +99,7 @@ private:
     std::vector<Hit> hits_;
 };
 
-AboutPanel::AboutPanel() {
+AboutPanel::AboutPanel() : openedAtMs_(juce::Time::getMillisecondCounterHiRes()) {
     about_ = juce::JSON::parse(resourceText("About_json"));
     changelog_ = resourceText("CHANGELOG_md");
 
@@ -149,6 +152,19 @@ void AboutPanel::paint(juce::Graphics& g) {
     g.drawRoundedRectangle(card.reduced(0.5f), 8.0f * s, 1.0f);
 
     auto head = card.reduced(24.0f * s, 20.0f * s);
+    head.removeFromLeft(kHeadHeight * s);
+    {
+        // draw-in over the first two seconds (eased), motion blooming in alongside it
+        const float elapsed = static_cast<float>(juce::jmax(0.0, (juce::Time::getMillisecondCounterHiRes() - openedAtMs_) * 0.001 - 0.12));
+        const float x = juce::jmin(1.0f, elapsed / 2.0f);
+        logo::Motion motion;
+        motion.time = elapsed;
+        motion.reveal = 1.0f - (1.0f - x) * (1.0f - x);
+        motion.depth = juce::jmin(1.0f, elapsed / 1.4f);
+        logoAnimator_.draw(g, glyphBounds(), motion);
+    }
+    head.removeFromLeft(18.0f * s);
+    head.removeFromTop((kHeadHeight - 72.0f) * 0.5f * s);
     g.setColour(colours::textPrimary);
     g.setFont(TetraLookAndFeel::font(26.0f * s, Weight::SemiBold));
     g.drawText(about_["name"].toString(), head.removeFromTop(32.0f * s), juce::Justification::centredLeft);
@@ -159,11 +175,22 @@ void AboutPanel::paint(juce::Graphics& g) {
     g.drawText(versionLine(), head.removeFromTop(20.0f * s), juce::Justification::centredLeft);
 }
 
+juce::Rectangle<float> AboutPanel::glyphBounds() const {
+    const float s = scaleOf(const_cast<AboutPanel&>(*this));
+    auto head = cardBounds().toFloat().reduced(24.0f * s, 20.0f * s);
+    return head.removeFromLeft(kHeadHeight * s).removeFromTop(kHeadHeight * s).reduced(2.0f * s);
+}
+
+void AboutPanel::timerCallback() {
+    // only the logo moves; the shadow margin keeps the cached base and the repaint in step
+    repaint(glyphBounds().expanded(glyphBounds().getWidth() * 0.12f).getSmallestIntegerContainer());
+}
+
 void AboutPanel::resized() {
     const float s = scaleOf(*this);
     auto card = cardBounds().reduced(static_cast<int>(24.0f * s), static_cast<int>(20.0f * s));
     close_.setBounds(card.getRight() - static_cast<int>(20.0f * s), card.getY(), static_cast<int>(20.0f * s), static_cast<int>(20.0f * s));
-    card.removeFromTop(static_cast<int>(74.0f * s));
+    card.removeFromTop(static_cast<int>((kHeadHeight + 4.0f) * s));
     link_.setFont(TetraLookAndFeel::font(14.0f * s, Weight::Medium), false, juce::Justification::centredLeft);
     link_.setBounds(card.removeFromTop(static_cast<int>(24.0f * s)).withWidth(static_cast<int>(200.0f * s)));
     card.removeFromTop(static_cast<int>(12.0f * s));
@@ -242,7 +269,13 @@ bool AboutPanel::keyPressed(const juce::KeyPress& k) {
 }
 
 void AboutPanel::visibilityChanged() {
-    if (isVisible()) grabKeyboardFocus();
+    if (isVisible()) {
+        grabKeyboardFocus();
+        openedAtMs_ = juce::Time::getMillisecondCounterHiRes();
+        startTimerHz(60);
+    } else {
+        stopTimer();
+    }
 }
 
 }  // namespace tdui

@@ -14,7 +14,9 @@ juce::NormalisableRange<float> hzRange(float lo, float hi) {
             [](float a, float b, float x) { return juce::jlimit(a, b, x); }};
 }
 
-bool isDiscrete(int index) { return index == td::kShape || index == td::kSolo || index == td::kNumParams; }
+bool isDiscrete(int index) {
+    return index == td::kShape || index == td::kSolo || index == td::kOversample || index == td::kCrossover || index == td::kNumParams;
+}
 
 }  // namespace
 
@@ -26,7 +28,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout TetraDriveProcessor::createL
         if (s.unit == td::Unit::Choice) {
             juce::StringArray names;
             if (i == td::kShape) for (auto* n : td::kShapeNames) names.add(n);
-            else for (auto* n : td::kSoloNames) names.add(n);
+            else if (i == td::kSolo) for (auto* n : td::kSoloNames) names.add(n);
+            else if (i == td::kOversample) for (auto* n : td::kOversampleNames) names.add(n);
+            else for (auto* n : td::kCrossoverNames) names.add(n);
             layout.add(std::make_unique<juce::AudioParameterChoice>(id, s.name, names, static_cast<int>(s.def)));
             continue;
         }
@@ -54,6 +58,7 @@ TetraDriveProcessor::TetraDriveProcessor()
     jassert(bypass_ != nullptr && bypass_->getParameterIndex() == kBypassIndex);
     for (int e = 0; e <= td::kBands; ++e) edgeTargets_[static_cast<std::size_t>(e)] = td::kParams[static_cast<std::size_t>(td::edgeParam(e))].def;
     syncAllParams(true);
+    setLatencySamples(engine_.latencySamples());
 }
 
 juce::String TetraDriveProcessor::versionString() { return JucePlugin_VersionString; }
@@ -69,8 +74,10 @@ void TetraDriveProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) 
     engine_.prepare(sampleRate, juce::jlimit(1, td::kMaxChannels, getTotalNumInputChannels()));
     engine_.reserve(juce::jmax(samplesPerBlock, 64));
     analyzer.prepare(sampleRate);
+    analyzerOut.prepare(sampleRate);
     events_.clear();
     syncAllParams(true);
+    setLatencySamples(engine_.latencySamples());
 }
 
 void TetraDriveProcessor::addParameterPoint(juce::AudioProcessorParameter& parameter, int sampleOffset, float value) noexcept {
@@ -108,6 +115,17 @@ void TetraDriveProcessor::applyParam(int index, float normalised, int rampSample
             soloBand_ = static_cast<int>(std::lround(real)) - 1;
             engine_.setRouteTarget(soloBand_, bypassed_ || forcedBypass_);
             break;
+        case td::kOversample: {
+            const int stages = static_cast<int>(std::lround(real));
+            if (stages != engine_.oversampling()) {
+                engine_.setOversampling(stages);
+                triggerAsyncUpdate();
+            }
+            break;
+        }
+        case td::kCrossover:
+            engine_.setCrossover(std::lround(real) == 1 ? td::Crossover::Flat : td::Crossover::Classic);
+            break;
         default: break;
     }
 }
@@ -133,6 +151,7 @@ void TetraDriveProcessor::processInternal(juce::AudioBuffer<float>& buffer, bool
     if (n <= 0 || channels <= 0) { events_.clear(); return; }
 
     analyzer.push(buffer.getArrayOfReadPointers(), channels, n);
+    pushChannelPeaks(meters.input, buffer, channels, n);
 
     // host bypass without a parameter change
     if (forceBypass != forcedBypass_) {
@@ -188,7 +207,23 @@ void TetraDriveProcessor::processInternal(juce::AudioBuffer<float>& buffer, bool
     }
     events_.clear();
 
+    analyzerOut.push(buffer.getArrayOfReadPointers(), channels, n);
+    pushChannelPeaks(meters.output, buffer, channels, n);
+    const auto band = engine_.takeMeters();
+    for (int b = 0; b < td::kBands; ++b) {
+        meters.bandHeat[static_cast<std::size_t>(b)].push(band.heat[static_cast<std::size_t>(b)]);
+        meters.bandOut[static_cast<std::size_t>(b)].push(band.outPeak[static_cast<std::size_t>(b)]);
+    }
     for (int c = channels; c < buffer.getNumChannels(); ++c) buffer.clear(c, 0, n);
+}
+
+// A mono stream feeds both meter channels so the display never shows a dead side.
+void TetraDriveProcessor::pushChannelPeaks(std::array<PeakAtomic, td::kMaxChannels>& dst, const juce::AudioBuffer<float>& buffer,
+                                           int channels, int n) {
+    for (int c = 0; c < td::kMaxChannels; ++c) {
+        const int src = juce::jmin(c, channels - 1);
+        dst[static_cast<std::size_t>(c)].push(buffer.getMagnitude(src, 0, n));
+    }
 }
 
 void TetraDriveProcessor::setRealValue(int index, float real) {
@@ -216,6 +251,7 @@ void TetraDriveProcessor::getStateInformation(juce::MemoryBlock& destData) {
     uiTree.setProperty("height", ui.height.load(), nullptr);
     uiTree.setProperty("fftOrder", ui.fftOrder.load(), nullptr);
     uiTree.setProperty("analyzerOn", ui.analyzerOn.load(), nullptr);
+    uiTree.setProperty("analyzerSource", ui.analyzerSource.load(), nullptr);
     uiTree.setProperty("helpBar", ui.helpBar.load(), nullptr);
     state.appendChild(uiTree, nullptr);
     if (auto xml = state.createXml()) copyXmlToBinary(*xml, destData);
@@ -232,10 +268,22 @@ void TetraDriveProcessor::setStateInformation(const void* data, int sizeInBytes)
         ui.height = static_cast<int>(uiTree.getProperty("height", ui.height.load()));
         ui.fftOrder = juce::jlimit(12, 14, static_cast<int>(uiTree.getProperty("fftOrder", ui.fftOrder.load())));
         ui.analyzerOn = static_cast<bool>(uiTree.getProperty("analyzerOn", ui.analyzerOn.load()));
+        ui.analyzerSource = juce::jlimit(0, 2, static_cast<int>(uiTree.getProperty("analyzerSource", ui.analyzerSource.load())));
         ui.helpBar = static_cast<bool>(uiTree.getProperty("helpBar", ui.helpBar.load()));
         tree.removeChild(uiTree, nullptr);
     }
     const auto presetName = tree.getProperty("presetName", PresetManager::kDefaultName).toString();
+
+    // Parameters the session predates get their default, so older sessions recall exactly as
+    // they were; oversampling is the exception and goes to Off (no latency) rather than 2x.
+    for (int i = 0; i < td::kNumParams; ++i) {
+        const auto& spec = td::kParams[static_cast<std::size_t>(i)];
+        if (tree.getChildWithProperty("id", juce::String(spec.id)).isValid()) continue;
+        juce::ValueTree legacy("PARAM");
+        legacy.setProperty("id", juce::String(spec.id), nullptr);
+        legacy.setProperty("value", i == td::kOversample ? 0.0 : static_cast<double>(spec.def), nullptr);
+        tree.appendChild(legacy, nullptr);
+    }
     apvts.replaceState(tree);
     presets.restoreCurrent(presetName);
 }

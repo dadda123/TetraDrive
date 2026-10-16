@@ -34,7 +34,8 @@ public:
     static constexpr int kFormatVersion = 1;
 
 private:
-    static bool includedInPresets(int index) { return index != td::kSolo; }
+    // Solo is a listening aid and Oversampling a CPU/latency choice; neither belongs to a sound.
+    static bool includedInPresets(int index) { return index != td::kSolo && index != td::kOversample; }
     juce::File fileFor(const juce::String& name) const;
     void applyReal(const std::array<float, td::kNumParams>& values);
     std::array<float, td::kNumParams> currentReal() const;

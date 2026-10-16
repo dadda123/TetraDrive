@@ -66,8 +66,7 @@ void SpectrumAnalyzer::rebuildMap(const std::vector<float>& freqs) {
     mapLast_ = freqs.empty() ? 0.0f : freqs.back();
 }
 
-bool SpectrumAnalyzer::update(const std::vector<float>& freqs, std::vector<float>& db, double dtSeconds) {
-    // drain FIFO into the history ring
+int SpectrumAnalyzer::drainFifo() {
     const int ready = fifo_.getNumReady();
     if (ready > 0) {
         const auto r = fifo_.read(ready);
@@ -80,6 +79,11 @@ bool SpectrumAnalyzer::update(const std::vector<float>& freqs, std::vector<float
         take(r.startIndex1, r.blockSize1);
         take(r.startIndex2, r.blockSize2);
     }
+    return ready;
+}
+
+bool SpectrumAnalyzer::update(const std::vector<float>& freqs, std::vector<float>& db, double dtSeconds) {
+    const int ready = drainFifo();
 
     if (display_.size() != freqs.size()) display_.assign(freqs.size(), kFloorDb);
     const float decay = static_cast<float>(kReleaseDbPerSecond * juce::jlimit(0.0, 0.25, dtSeconds));

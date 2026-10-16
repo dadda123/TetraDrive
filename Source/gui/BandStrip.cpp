@@ -2,6 +2,7 @@
 
 #include "../PluginProcessor.h"
 #include "HelpBar.h"
+#include "MeterDisplay.h"
 #include "TetraLookAndFeel.h"
 
 namespace tdui {
@@ -35,14 +36,74 @@ void ParamKnob::paint(juce::Graphics& g) {
     g.drawText(title_, getLocalBounds().removeFromTop(static_cast<int>(16.0f * s)), juce::Justification::centred);
 }
 
-BandStrip::BandStrip(TetraDriveProcessor& p, int band)
+SaturationLed::SaturationLed(juce::Colour accent) : accent_(accent) {
+    setInterceptsMouseClicks(true, false);
+    describe(*this, "Saturation",
+             "How much this band's waveshaper is changing the signal: the difference between the shaped band and the clean band, "
+             "relative to the clean band. Dark = transparent, lit = audible saturation, white = mostly distortion.");
+}
+
+void SaturationLed::setHeat(float heat01) {
+    heat_ = juce::jlimit(0.0f, 1.0f, heat01);
+    const int q = juce::roundToInt(heat_ * 64.0f);
+    if (q != shown_) { shown_ = q; repaint(); }
+}
+
+float SaturationLed::lensRadius() const { return static_cast<float>(juce::jmin(getWidth(), getHeight())) * 0.13f; }
+
+bool SaturationLed::hitTest(int x, int y) {
+    return getLocalBounds().toFloat().getCentre().getDistanceFrom({static_cast<float>(x), static_cast<float>(y)}) <= lensRadius() * 1.8f;
+}
+
+void SaturationLed::paint(juce::Graphics& g) {
+    const auto area = getLocalBounds().toFloat();
+    const auto c = area.getCentre();
+    const float r = juce::jmin(area.getWidth(), area.getHeight()) * 0.5f;
+    const float lensR = lensRadius();
+    const float heat = heat_;
+
+    // corona: reaches further and burns brighter with heat; eased so a hint of saturation shows
+    const float glow = std::sqrt(heat);
+    if (glow > 0.0f) {
+        const float glowR = lensR + (r - lensR) * (0.3f + 0.7f * glow);
+        const auto hot = accent_.interpolatedWith(juce::Colours::white, 0.35f * heat);
+        juce::ColourGradient grad(hot.withAlpha(0.85f * glow), c.x, c.y, accent_.withAlpha(0.0f), c.x + glowR, c.y, true);
+        grad.addColour(0.25, accent_.withAlpha(0.45f * glow));
+        grad.addColour(0.55, accent_.withAlpha(0.14f * glow));
+        g.setGradientFill(grad);
+        g.fillEllipse(juce::Rectangle<float>(2 * glowR, 2 * glowR).withCentre(c));
+    }
+
+    // bezel
+    g.setColour(colours::background);
+    g.fillEllipse(juce::Rectangle<float>(2 * (lensR + 2.0f), 2 * (lensR + 2.0f)).withCentre(c));
+
+    // lens: dark glass -> band colour -> white-hot, with a brighter filament core once lit
+    const auto dim = colours::panelRaised.interpolatedWith(accent_, 0.16f);
+    const auto edge = heat < 0.7f ? dim.interpolatedWith(accent_, heat / 0.7f)
+                                  : accent_.interpolatedWith(juce::Colours::white, (heat - 0.7f) / 0.3f * 0.75f);
+    const auto core = edge.interpolatedWith(juce::Colours::white, 0.55f * heat);
+    juce::ColourGradient lens(core, c.x, c.y, edge, c.x + lensR, c.y, true);
+    g.setGradientFill(lens);
+    g.fillEllipse(juce::Rectangle<float>(2 * lensR, 2 * lensR).withCentre(c));
+    g.setColour(heat > 0.05f ? accent_.withAlpha(0.6f) : colours::outline);
+    g.drawEllipse(juce::Rectangle<float>(2 * lensR, 2 * lensR).withCentre(c), 1.0f);
+    // specular highlight keeps it reading as a lamp even when dark
+    g.setColour(juce::Colours::white.withAlpha(0.2f + 0.25f * heat));
+    g.fillEllipse(juce::Rectangle<float>(lensR * 0.75f, lensR * 0.42f).withCentre({c.x - lensR * 0.2f, c.y - lensR * 0.42f}));
+}
+
+BandStrip::BandStrip(TetraDriveProcessor& p, int band, const MeterDisplay& meters)
     : proc_(p),
       band_(band),
+      meters_(meters),
       drive_(p, td::driveParam(band), "Drive", colours::bands[static_cast<std::size_t>(band)]),
-      level_(p, td::levelParam(band), "Level", colours::bands[static_cast<std::size_t>(band)]) {
+      level_(p, td::levelParam(band), "Level", colours::bands[static_cast<std::size_t>(band)]),
+      led_(colours::bands[static_cast<std::size_t>(band)]) {
     header_ = td::kBandNames[static_cast<std::size_t>(band)];
     addAndMakeVisible(drive_);
     addAndMakeVisible(level_);
+    addAndMakeVisible(led_);
     solo_.setClickingTogglesState(false);
     solo_.getProperties().set("accent", static_cast<juce::int64>(colours::bands[static_cast<std::size_t>(band)].getARGB()));
     describe(solo_, "Solo " + juce::String(td::kBandNames[static_cast<std::size_t>(band)]), "Listen to this band on its own. Click again to hear all bands.");
@@ -64,6 +125,15 @@ void BandStrip::refresh() {
     if (range != range_) { range_ = range; repaint(); }
     const bool soloed = static_cast<int>(std::lround(proc_.realValue(td::kSolo))) == band_ + 1;
     solo_.setToggleState(soloed, juce::dontSendNotification);
+
+    const int level = juce::roundToInt(MeterDisplay::fraction(meters_.bandOutDb[static_cast<std::size_t>(band_)]) * meterBar().getWidth());
+    if (level != shownLevel_) { shownLevel_ = level; repaint(meterBar().expanded(1.0f).toNearestInt()); }
+    led_.setHeat(meters_.bandSaturation(band_));
+}
+
+juce::Rectangle<float> BandStrip::meterBar() const {
+    const float s = scaleOf(const_cast<BandStrip&>(*this));
+    return getLocalBounds().toFloat().removeFromTop(3.0f * s).reduced(10.0f * s, 0.0f);
 }
 
 void BandStrip::paint(juce::Graphics& g) {
@@ -72,8 +142,15 @@ void BandStrip::paint(juce::Graphics& g) {
     g.setColour(colours::panel);
     g.fillRoundedRectangle(r, 6.0f * s);
     const auto colour = colours::bands[static_cast<std::size_t>(band_)];
-    g.setColour(colour);
-    g.fillRoundedRectangle(r.removeFromTop(3.0f * s).reduced(10.0f * s, 0.0f), 1.5f * s);
+    // the accent bar doubles as the band's output level meter
+    const auto bar = meterBar();
+    g.setColour(colour.withAlpha(0.28f));
+    g.fillRoundedRectangle(bar, 1.5f * s);
+    const float level = MeterDisplay::fraction(meters_.bandOutDb[static_cast<std::size_t>(band_)]);
+    if (level > 0.0f) {
+        g.setColour(colour);
+        g.fillRoundedRectangle(bar.withWidth(juce::jmax(3.0f * s, bar.getWidth() * level)), 1.5f * s);
+    }
 
     auto head = getLocalBounds().reduced(static_cast<int>(10.0f * s), 0).withTrimmedTop(static_cast<int>(8.0f * s)).removeFromTop(static_cast<int>(20.0f * s));
     juce::AttributedString text;
@@ -93,6 +170,15 @@ void BandStrip::resized() {
     r.removeFromBottom(static_cast<int>(6.0f * s));
     drive_.setBounds(r.removeFromLeft(r.getWidth() / 2));
     level_.setBounds(r);
+
+    // lamp in the free corner above the drive knob's arc (the rotary is inset 2 px and sits
+    // above its text box), on the 45 degree diagonal just outside the ring
+    auto knob = drive_.getBounds().withTrimmedTop(static_cast<int>(16.0f * s)).withTrimmedBottom(static_cast<int>(18.0f * s)).reduced(2);
+    const float kr = static_cast<float>(juce::jmin(knob.getWidth(), knob.getHeight())) * 0.5f;
+    const auto centre = knob.getCentre().toFloat();
+    const float ledSize = juce::jlimit(30.0f, 56.0f, kr * 1.2f);   // mostly corona; lens is ~a quarter of this
+    const juce::Point<float> ledCentre{centre.x + kr * 0.82f, centre.y - kr * 0.82f};
+    led_.setBounds(juce::Rectangle<float>(ledSize, ledSize).withCentre(ledCentre).toNearestInt());
 }
 
 }  // namespace tdui
